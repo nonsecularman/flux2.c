@@ -307,44 +307,40 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
      * Use BLAS/GPU for Q@K^T and scores@V matrix multiplications */
     int heads_per_kv = num_heads / num_kv_heads;
 
-    /* Use pre-allocated work buffers to avoid per-call allocation */
-    float *q_head = model->attn_q_head;
+    /* Use pre-allocated work buffer for K transpose (Q, V, output use strided access) */
     float *k_head_t = model->attn_k_head_t;
-    float *v_head = model->attn_v_head;
-    float *out_head = model->attn_out_head;
 
     for (int h = 0; h < num_heads; h++) {
         int kv_h = h / heads_per_kv;  /* Which KV head to use */
         float *scores = model->attn_scores + h * seq_len * seq_len;
 
-        /* Extract Q for this head: [seq_len, head_dim] */
-        for (int s = 0; s < seq_len; s++) {
-            memcpy(q_head + s * head_dim,
-                   model->q_buf + s * q_dim + h * head_dim,
-                   head_dim * sizeof(float));
-        }
+        /* Q can be accessed directly with strided lda (avoids copy)
+         * Q[s,d] = q_buf[s * q_dim + h * head_dim + d]
+         * Use pointer to head h with lda = q_dim */
+        const float *q_strided = model->q_buf + h * head_dim;
 
-        /* Extract K^T for this KV head: [head_dim, seq_len] */
+        /* K still needs transpose: K^T[d,s] = K[s,kv_h,d]
+         * This requires explicit transpose since we need [head_dim, seq_len] layout */
         for (int s = 0; s < seq_len; s++) {
             for (int d = 0; d < head_dim; d++) {
                 k_head_t[d * seq_len + s] = model->k_buf[s * kv_dim + kv_h * head_dim + d];
             }
         }
 
-        /* scores = scale * Q @ K^T using BLAS (GPU not used - small matrices)
-         * Q: [seq_len, head_dim], K^T: [head_dim, seq_len], scores: [seq_len, seq_len] */
+        /* scores = scale * Q @ K^T using strided BLAS
+         * Q: [seq_len, head_dim] with lda=q_dim, K^T: [head_dim, seq_len] */
 #ifdef USE_BLAS
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     seq_len, seq_len, head_dim,
-                    scale, q_head, head_dim, k_head_t, seq_len,
+                    scale, q_strided, q_dim, k_head_t, seq_len,
                     0.0f, scores, seq_len);
 #else
-        /* Fallback: naive matmul */
+        /* Fallback: naive matmul with strided Q access */
         for (int i = 0; i < seq_len; i++) {
             for (int j = 0; j < seq_len; j++) {
                 float dot = 0.0f;
                 for (int d = 0; d < head_dim; d++) {
-                    dot += q_head[i * head_dim + d] * k_head_t[d * seq_len + j];
+                    dot += q_strided[i * q_dim + d] * k_head_t[d * seq_len + j];
                 }
                 scores[i * seq_len + j] = dot * scale;
             }
@@ -364,38 +360,32 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
             qwen3_softmax(scores + i * seq_len, seq_len);
         }
 
-        /* Extract V for this KV head: [seq_len, head_dim] */
-        for (int s = 0; s < seq_len; s++) {
-            memcpy(v_head + s * head_dim,
-                   model->v_buf + s * kv_dim + kv_h * head_dim,
-                   head_dim * sizeof(float));
-        }
+        /* V can be accessed directly with strided lda (avoids copy)
+         * V[s,d] = v_buf[s * kv_dim + kv_h * head_dim + d] */
+        const float *v_strided = model->v_buf + kv_h * head_dim;
 
-        /* out = scores @ V using BLAS (GPU not used - small matrices)
-         * scores: [seq_len, seq_len], V: [seq_len, head_dim], out: [seq_len, head_dim] */
+        /* Output can be written directly with strided ldc (avoids copy)
+         * out[s,d] = attn_out[s * q_dim + h * head_dim + d] */
+        float *out_strided = model->attn_out + h * head_dim;
+
+        /* out = scores @ V using strided BLAS (avoids V copy and output copy)
+         * scores: [seq_len, seq_len], V: [seq_len, head_dim] with ldb=kv_dim */
 #ifdef USE_BLAS
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     seq_len, head_dim, seq_len,
-                    1.0f, scores, seq_len, v_head, head_dim,
-                    0.0f, out_head, head_dim);
+                    1.0f, scores, seq_len, v_strided, kv_dim,
+                    0.0f, out_strided, q_dim);
 #else
         for (int i = 0; i < seq_len; i++) {
             for (int d = 0; d < head_dim; d++) {
                 float sum = 0.0f;
                 for (int j = 0; j < seq_len; j++) {
-                    sum += scores[i * seq_len + j] * v_head[j * head_dim + d];
+                    sum += scores[i * seq_len + j] * v_strided[j * kv_dim + d];
                 }
-                out_head[i * head_dim + d] = sum;
+                out_strided[i * q_dim + d] = sum;
             }
         }
 #endif
-
-        /* Copy output back to attn_out */
-        for (int s = 0; s < seq_len; s++) {
-            memcpy(model->attn_out + s * q_dim + h * head_dim,
-                   out_head + s * head_dim,
-                   head_dim * sizeof(float));
-        }
     }
 
     /* Work buffers are pre-allocated in model, no free needed */
