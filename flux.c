@@ -185,13 +185,13 @@ static int flux_load_transformer_if_needed(flux_ctx *ctx) {
     snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors",
              ctx->model_dir);
 
-    if (flux_phase_callback) flux_phase_callback("loading transformer", 0);
+    if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 0);
     safetensors_file_t *sf = safetensors_open(path);
     if (sf) {
         ctx->transformer = flux_transformer_load_safetensors(sf);
         safetensors_close(sf);
     }
-    if (flux_phase_callback) flux_phase_callback("loading transformer", 1);
+    if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 1);
 
     if (!ctx->transformer) {
         set_error("Failed to load transformer");
@@ -215,13 +215,13 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
         return NULL;
     }
 
-    /* Reload encoder if it was released */
+    /* Load encoder if not already loaded */
     if (!ctx->qwen3_encoder && ctx->model_dir[0]) {
-        if (flux_phase_callback) flux_phase_callback("reloading encoder", 0);
+        if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 0);
         ctx->qwen3_encoder = qwen3_encoder_load(ctx->model_dir);
-        if (flux_phase_callback) flux_phase_callback("reloading encoder", 1);
+        if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 1);
         if (!ctx->qwen3_encoder) {
-            fprintf(stderr, "Warning: Failed to reload text encoder\n");
+            fprintf(stderr, "Warning: Failed to load Qwen3 text encoder\n");
         }
     }
 

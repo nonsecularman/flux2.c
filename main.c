@@ -357,8 +357,8 @@ int main(int argc, char *argv[]) {
     }
     LOG_VERBOSE("\n");
 
-    /* Load model */
-    LOG_NORMAL("Loading model...");
+    /* Load model (VAE only at startup, other components loaded on-demand) */
+    LOG_NORMAL("Loading VAE...");
     if (output_level >= OUTPUT_NORMAL) fflush(stderr);
     timer_begin();
 
