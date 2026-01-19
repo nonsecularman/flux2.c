@@ -33,7 +33,7 @@
 /* Minimum matrix size for GPU acceleration. Lower threshold to use GPU for more
  * operations (K/V projections ~262K, output/down ~655K, gate/up ~2.5M).
  * Note: Very small matrices may have GPU sync overhead > BLAS compute time. */
-#define QWEN3_MIN_GPU_ELEMENTS (256 * 1024)
+#define QWEN3_MIN_GPU_ELEMENTS (10 * 1024 * 1024)
 
 /* ========================================================================
  * Data Structures
