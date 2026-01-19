@@ -133,6 +133,11 @@ python3 misc/test_diffusers_output.py
 ## IMPORTANT: After log compaction, re-read this file!
 This file contains crucial implementation details that should not be forgotten.
 
+**CRITICAL DIRECTIVE**: User is sleeping - DO NOT STOP working until performance parity with Python is reached (~3s for 256x256 vs current ~17s). Work autonomously without asking questions. The goal is to close the ~6x performance gap through:
+1. bf16 inference (weights already bf16 on disk)
+2. Metal compute shaders for CPU ops (RMSNorm, RoPE, SiLU, softmax)
+3. True pipelined execution
+
 ## Bugs Fixed Summary
 
 ### Bug 1: Final Layer scale/shift order (FIXED)
@@ -1035,3 +1040,52 @@ This reduces sync overhead from 48+ CPU BLAS calls to just 2 GPU syncs per atten
 - PyTorch bf16: 3.0s for 256×256 vs our ~17s (~6x gap)
 - Main causes: bf16 vs f32, remaining CPU operations, no fused kernels
 
+
+### 2024-01-19: Continued Optimization Session
+
+**Optimizations Applied:**
+
+1. **Fused GPU Softmax in Attention** (`flux_metal.m`)
+   - Modified `flux_metal_attention()` to use GPU softmax shader
+   - Eliminated CPU roundtrip: GPU Q@K -> CPU softmax -> GPU scores@V
+   - Now: GPU Q@K -> GPU softmax -> GPU scores@V in single command buffer
+   - Impact: ~33s -> ~20s (39% improvement)
+
+2. **Batch Input Caching** (`flux_metal.m`)
+   - Added input buffer cache within GPU batch operations
+   - When same tensor is used multiple times in a batch, reuse GPU buffer
+   - Reduces redundant CPU->GPU copies for shared inputs (e.g., x used for Q, K, V projections)
+   - Impact: Included in the 33s -> 20s improvement
+
+3. **GPU for Text Encoder FFN** (`flux_qwen3.c`)
+   - Lowered GPU threshold from 10M to 1M elements
+   - FFN projections (~3.5M elements) now use GPU instead of BLAS
+   - Impact: Text encoding 5.4s -> 4.4s
+
+4. **Pre-allocated Attention Buffers** (`flux_qwen3.c`)
+   - Moved per-call mallocs to model struct for attention work buffers
+   - Avoids 32 heads * 36 layers = 1152 malloc/free pairs per text encoding
+   - Impact: Text encoding 4.4s -> 4.1s
+
+**Current Performance (256x256):**
+
+| Component | Before | After | Improvement |
+|-----------|--------|-------|-------------|
+| Loading | 5.2s | 5.4s | (disk I/O) |
+| Text Encoding | 11s | 4.1s | 63% faster |
+| Denoising | ~17s | ~4.5s | 74% faster |
+| VAE Decode | 2.0s | 2.0s | (no change) |
+| **Total** | ~33s | ~16s | **52% faster** |
+
+**Remaining Gap to PyTorch (~3s):**
+- Excluding loading: 10.6s vs ~3s = 3.5x slower
+- Main bottlenecks:
+  1. Text encoder attention still processes 32 heads sequentially
+  2. VAE decoder uses CPU only
+  3. Various CPU-GPU sync points in denoising
+  4. No Flash Attention or fused kernels
+
+**Key Commits:**
+- `828125c` - Fused GPU softmax and input caching
+- `551f8fe` - GPU for text encoder FFN
+- `050421f` - Pre-allocated attention buffers
