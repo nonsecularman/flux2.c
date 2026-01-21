@@ -287,11 +287,7 @@ static int g_pool_count = 0;
 static pthread_mutex_t g_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int tensor_zero_init_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        enabled = getenv("FLUX_ZERO_TENSORS") ? 1 : 0;
-    }
-    return enabled;
+    return 1;
 }
 
 /* Forward declarations for tensor batch/chain mode checks. */
@@ -463,6 +459,11 @@ int flux_metal_available(void) {
     return g_initialized;
 }
 
+static void clear_bf16_cache(void);
+static void clear_f16_cache(void);
+static void clear_rope_cache(void);
+void flux_metal_rope_cache_begin(void);
+
 void flux_metal_cleanup(void) {
     if (!g_initialized) return;
 
@@ -472,15 +473,15 @@ void flux_metal_cleanup(void) {
             flux_metal_end_batch();
         }
         clear_weight_cache();
+        clear_bf16_cache();
+        clear_f16_cache();
+        clear_rope_cache();
         clear_activation_pool();
         g_queue = nil;
         g_device = nil;
         g_initialized = 0;
     }
 }
-
-/* Forward declaration - defined after f16 cache variables */
-static void clear_f16_cache(void);
 
 void flux_metal_reset(void) {
     if (!g_initialized) return;
@@ -501,7 +502,9 @@ void flux_metal_reset(void) {
 
         /* Clear all caches */
         clear_weight_cache();
+        clear_bf16_cache();
         clear_f16_cache();
+        clear_rope_cache();
         clear_activation_pool();
 
         /* Clear batch input cache */
@@ -533,6 +536,11 @@ void flux_metal_clear_activation_pool_only(void) {
     if (!g_initialized) return;
     flux_metal_sync();
     clear_activation_pool();
+}
+
+void flux_metal_rope_cache_begin(void) {
+    if (!g_initialized) return;
+    clear_rope_cache();
 }
 
 /* ========================================================================
@@ -794,6 +802,60 @@ static bf16_cache_entry_t g_bf16_cache[BF16_WEIGHT_CACHE_SIZE];
 static int g_bf16_cache_count = 0;
 static pthread_mutex_t g_bf16_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* RoPE cache (per forward pass) */
+#define ROPE_CACHE_SIZE 8
+typedef struct {
+    const void *cpu_ptr;
+    size_t size;
+    id<MTLBuffer> gpu_buffer;
+} rope_cache_entry_t;
+
+static rope_cache_entry_t g_rope_cache[ROPE_CACHE_SIZE];
+static int g_rope_cache_count = 0;
+static pthread_mutex_t g_rope_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static id<MTLBuffer> get_rope_buffer(const float *data, size_t size) {
+    if (!data || size == 0) return nil;
+
+    pthread_mutex_lock(&g_rope_cache_mutex);
+    for (int i = 0; i < g_rope_cache_count; i++) {
+        if (g_rope_cache[i].cpu_ptr == data && g_rope_cache[i].size == size) {
+            id<MTLBuffer> buf = g_rope_cache[i].gpu_buffer;
+            pthread_mutex_unlock(&g_rope_cache_mutex);
+            return buf;
+        }
+    }
+
+    id<MTLBuffer> buf = [g_device newBufferWithBytes:data
+                                              length:size
+                                             options:MTLResourceStorageModeShared];
+    if (!buf) {
+        pthread_mutex_unlock(&g_rope_cache_mutex);
+        return nil;
+    }
+
+    if (g_rope_cache_count < ROPE_CACHE_SIZE) {
+        g_rope_cache[g_rope_cache_count].cpu_ptr = data;
+        g_rope_cache[g_rope_cache_count].size = size;
+        g_rope_cache[g_rope_cache_count].gpu_buffer = buf;
+        g_rope_cache_count++;
+    }
+
+    pthread_mutex_unlock(&g_rope_cache_mutex);
+    return buf;
+}
+
+static void clear_rope_cache(void) {
+    pthread_mutex_lock(&g_rope_cache_mutex);
+    for (int i = 0; i < g_rope_cache_count; i++) {
+        g_rope_cache[i].gpu_buffer = nil;
+        g_rope_cache[i].cpu_ptr = NULL;
+        g_rope_cache[i].size = 0;
+    }
+    g_rope_cache_count = 0;
+    pthread_mutex_unlock(&g_rope_cache_mutex);
+}
+
 /* Get bf16 weights buffer (no conversion - native bf16 for MPS) */
 static id<MTLBuffer> get_cached_bf16_buffer(const uint16_t *weights, size_t num_elements) {
     pthread_mutex_lock(&g_bf16_cache_mutex);
@@ -833,6 +895,16 @@ static id<MTLBuffer> get_cached_bf16_buffer(const uint16_t *weights, size_t num_
 }
 
 /* Clear bf16 weight cache */
+static void clear_bf16_cache(void) {
+    pthread_mutex_lock(&g_bf16_cache_mutex);
+    for (int i = 0; i < g_bf16_cache_count; i++) {
+        g_bf16_cache[i].gpu_buffer = nil;
+        g_bf16_cache[i].cpu_ptr = NULL;
+    }
+    g_bf16_cache_count = 0;
+    pthread_mutex_unlock(&g_bf16_cache_mutex);
+}
+
 /* F16 weight cache (stores bf16 weights converted to f16 for older MPS) */
 #define F16_WEIGHT_CACHE_SIZE 512
 
@@ -1805,6 +1877,9 @@ int flux_bf16_pipeline_available(void) {
              g_gated_add_bf16_pipeline &&
              g_rope_unified_bf16_pipeline &&
              g_rope_2d_bf16_pipeline &&
+             g_bmm_bf16_qkt_pipeline &&
+             g_bmm_bf16_sv_pipeline &&
+             g_softmax_bf16_pipeline &&
              g_linear_bf16_pipeline &&
              g_concat_seq_bf16_pipeline &&
              g_slice_seq_bf16_pipeline &&
@@ -1824,6 +1899,9 @@ int flux_bf16_pipeline_available(void) {
             if (!g_gated_add_bf16_pipeline) fprintf(stderr, "[BF16] missing gated_add_bf16\n");
             if (!g_rope_unified_bf16_pipeline) fprintf(stderr, "[BF16] missing rope_unified_bf16\n");
             if (!g_rope_2d_bf16_pipeline) fprintf(stderr, "[BF16] missing rope_2d_bf16\n");
+            if (!g_bmm_bf16_qkt_pipeline) fprintf(stderr, "[BF16] missing bmm_bf16_qkt\n");
+            if (!g_bmm_bf16_sv_pipeline) fprintf(stderr, "[BF16] missing bmm_bf16_sv\n");
+            if (!g_softmax_bf16_pipeline) fprintf(stderr, "[BF16] missing softmax_bf16\n");
             if (!g_linear_bf16_pipeline) fprintf(stderr, "[BF16] missing linear_bf16\n");
             if (!g_concat_seq_bf16_pipeline) fprintf(stderr, "[BF16] missing concat_seq_bf16\n");
             if (!g_slice_seq_bf16_pipeline) fprintf(stderr, "[BF16] missing slice_seq_bf16\n");
@@ -2001,10 +2079,10 @@ void flux_bf16_rope_unified(id<MTLBuffer> x,
         size_t txt_size = (size_t)txt_len * head_dim * sizeof(float);
         size_t img_size = (size_t)img_len * head_dim * sizeof(float);
 
-        id<MTLBuffer> bufTxtCos = get_cached_weight_buffer(txt_cos, txt_size);
-        id<MTLBuffer> bufTxtSin = get_cached_weight_buffer(txt_sin, txt_size);
-        id<MTLBuffer> bufImgCos = get_cached_weight_buffer(img_cos, img_size);
-        id<MTLBuffer> bufImgSin = get_cached_weight_buffer(img_sin, img_size);
+        id<MTLBuffer> bufTxtCos = get_rope_buffer(txt_cos, txt_size);
+        id<MTLBuffer> bufTxtSin = get_rope_buffer(txt_sin, txt_size);
+        id<MTLBuffer> bufImgCos = get_rope_buffer(img_cos, img_size);
+        id<MTLBuffer> bufImgSin = get_rope_buffer(img_sin, img_size);
 
         if (!bufTxtCos || !bufTxtSin || !bufImgCos || !bufImgSin) return;
 
@@ -2030,6 +2108,7 @@ void flux_bf16_rope_unified(id<MTLBuffer> x,
 
         [cmdBuffer commit];
         [cmdBuffer waitUntilCompleted];
+
     }
 }
 
@@ -2101,9 +2180,7 @@ flux_gpu_tensor_t flux_gpu_tensor_alloc(size_t num_elements) {
         id<MTLBuffer> buf = pool_get_buffer(size);
         if (!buf) return NULL;
 
-        if (tensor_zero_init_enabled()) {
-            memset([buf contents], 0, size);
-        }
+        memset([buf contents], 0, size);
 
         /* Allocate tensor structure */
         flux_gpu_tensor_t tensor = (flux_gpu_tensor_t)malloc(sizeof(struct flux_gpu_tensor));
@@ -4323,74 +4400,66 @@ int flux_gpu_attention_fused_bf16(flux_gpu_tensor_t out,
     if (!out || !Q || !K || !V) return 0;
     if (!out->is_f16 || !Q->is_f16 || !K->is_f16 || !V->is_f16) return 0;
 
-    const char *attn_mode = getenv("FLUX_BF16_ATTENTION");
-    int force_graph = (attn_mode && strcmp(attn_mode, "graph") == 0);
-    int force_fused = (attn_mode && strcmp(attn_mode, "fused") == 0);
+    if (seq_k <= 1024 && g_attention_fused_bf16_pipeline) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
 
-    int want_graph = force_graph || (!force_fused && seq_k > 1024);
-    if (want_graph) {
+            if (bf16_debug_enabled()) {
+                fprintf(stderr, "[BF16] attention_fused_bf16 seq_q=%d seq_k=%d heads=%d head_dim=%d\n",
+                        seq_q, seq_k, num_heads, head_dim);
+            }
+
+            [encoder setComputePipelineState:g_attention_fused_bf16_pipeline];
+            [encoder setBuffer:Q->buffer offset:0 atIndex:0];
+            [encoder setBuffer:K->buffer offset:0 atIndex:1];
+            [encoder setBuffer:V->buffer offset:0 atIndex:2];
+            [encoder setBuffer:out->buffer offset:0 atIndex:3];
+            [encoder setBytes:&seq_q length:sizeof(int) atIndex:4];
+            [encoder setBytes:&seq_k length:sizeof(int) atIndex:5];
+            [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
+            [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
+            [encoder setBytes:&scale length:sizeof(float) atIndex:8];
+
+            /* Dispatch: one threadgroup per (query_pos, head) pair */
+            NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+            [encoder dispatchThreadgroups:MTLSizeMake(seq_q, num_heads, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+            [encoder endEncoding];
+
+            out->has_pending_work = 1;
+            Q->has_pending_work = 1;
+            K->has_pending_work = 1;
+            V->has_pending_work = 1;
+
+            if (!g_tensor_batch_mode) {
+                [cmdBuffer commit];
+                [cmdBuffer waitUntilCompleted];
+                out->has_pending_work = 0;
+                Q->has_pending_work = 0;
+                K->has_pending_work = 0;
+                V->has_pending_work = 0;
+            }
+
+            return 1;
+        }
+    }
+
+    if (NSClassFromString(@"MPSGraph")) {
         if (flux_gpu_attention_mpsgraph_bf16(out, Q, K, V, seq_q, seq_k, num_heads, head_dim, scale)) {
             return 1;
         }
     }
-    if (!g_attention_fused_bf16_pipeline) {
-        if (bf16_debug_enabled()) {
-            fprintf(stderr, "[BF16] attention_fused_bf16 missing pipeline\n");
-        }
-        return 0;
+
+    if (seq_k > 1024 && bf16_debug_enabled()) {
+        fprintf(stderr, "[BF16] attention_fused_bf16 seq_k=%d too large\n", seq_k);
     }
-
-    /* Limit seq_k length to what the shader can handle (1024 for shared memory). */
-    if (seq_k > 1024) {
-        if (bf16_debug_enabled()) {
-            fprintf(stderr, "[BF16] attention_fused_bf16 seq_k=%d too large\n", seq_k);
-        }
-        return 0;
+    if (!g_attention_fused_bf16_pipeline && bf16_debug_enabled()) {
+        fprintf(stderr, "[BF16] attention_fused_bf16 missing pipeline\n");
     }
+    return 0;
 
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
-        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
-
-        if (bf16_debug_enabled()) {
-            fprintf(stderr, "[BF16] attention_fused_bf16 seq_q=%d seq_k=%d heads=%d head_dim=%d\n",
-                    seq_q, seq_k, num_heads, head_dim);
-        }
-
-        [encoder setComputePipelineState:g_attention_fused_bf16_pipeline];
-        [encoder setBuffer:Q->buffer offset:0 atIndex:0];
-        [encoder setBuffer:K->buffer offset:0 atIndex:1];
-        [encoder setBuffer:V->buffer offset:0 atIndex:2];
-        [encoder setBuffer:out->buffer offset:0 atIndex:3];
-        [encoder setBytes:&seq_q length:sizeof(int) atIndex:4];
-        [encoder setBytes:&seq_k length:sizeof(int) atIndex:5];
-        [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
-        [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
-        [encoder setBytes:&scale length:sizeof(float) atIndex:8];
-
-        /* Dispatch: one threadgroup per (query_pos, head) pair */
-        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
-        [encoder dispatchThreadgroups:MTLSizeMake(seq_q, num_heads, 1)
-                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-
-        [encoder endEncoding];
-
-        out->has_pending_work = 1;
-        Q->has_pending_work = 1;
-        K->has_pending_work = 1;
-        V->has_pending_work = 1;
-
-        if (!g_tensor_batch_mode) {
-            [cmdBuffer commit];
-            [cmdBuffer waitUntilCompleted];
-            out->has_pending_work = 0;
-            Q->has_pending_work = 0;
-            K->has_pending_work = 0;
-            V->has_pending_work = 0;
-        }
-
-        return 1;
-    }
 }
 
 /* ========================================================================
@@ -4543,10 +4612,10 @@ void flux_gpu_rope_unified_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
         size_t txt_size = (size_t)txt_len * head_dim * sizeof(float);
         size_t img_size = (size_t)img_len * head_dim * sizeof(float);
 
-        id<MTLBuffer> bufTxtCos = get_cached_weight_buffer(txt_cos, txt_size);
-        id<MTLBuffer> bufTxtSin = get_cached_weight_buffer(txt_sin, txt_size);
-        id<MTLBuffer> bufImgCos = get_cached_weight_buffer(img_cos, img_size);
-        id<MTLBuffer> bufImgSin = get_cached_weight_buffer(img_sin, img_size);
+        id<MTLBuffer> bufTxtCos = get_rope_buffer(txt_cos, txt_size);
+        id<MTLBuffer> bufTxtSin = get_rope_buffer(txt_sin, txt_size);
+        id<MTLBuffer> bufImgCos = get_rope_buffer(img_cos, img_size);
+        id<MTLBuffer> bufImgSin = get_rope_buffer(img_sin, img_size);
 
         if (!bufTxtCos || !bufTxtSin || !bufImgCos || !bufImgSin) return;
 
@@ -4598,6 +4667,7 @@ void flux_gpu_rope_unified_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
             q->has_pending_work = 0;
             k->has_pending_work = 0;
         }
+
     }
 }
 
@@ -4610,8 +4680,8 @@ void flux_gpu_rope_2d_bf16(flux_gpu_tensor_t x,
 
     @autoreleasepool {
         size_t freq_size = (size_t)seq * head_dim * sizeof(float);
-        id<MTLBuffer> bufCos = get_cached_weight_buffer(cos_freq, freq_size);
-        id<MTLBuffer> bufSin = get_cached_weight_buffer(sin_freq, freq_size);
+        id<MTLBuffer> bufCos = get_rope_buffer(cos_freq, freq_size);
+        id<MTLBuffer> bufSin = get_rope_buffer(sin_freq, freq_size);
         if (!bufCos || !bufSin) return;
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
@@ -4635,6 +4705,7 @@ void flux_gpu_rope_2d_bf16(flux_gpu_tensor_t x,
             [cmdBuffer waitUntilCompleted];
             x->has_pending_work = 0;
         }
+
     }
 }
 
@@ -4871,7 +4942,7 @@ flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
                                                int seq_len, int in_dim, int out_dim) {
     if (!g_shaders_initialized || !x || !x->is_f16 || !W_bf16) return NULL;
 
-    if (bf16_linear_use_graph(seq_len, in_dim, out_dim)) {
+    if (!tensor_batch_active() && bf16_linear_use_graph(seq_len, in_dim, out_dim)) {
         flux_gpu_tensor_t graph_out = flux_gpu_linear_bf16_mpsgraph(x, W_bf16,
                                                                     seq_len, in_dim, out_dim);
         if (graph_out) {

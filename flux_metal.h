@@ -39,6 +39,7 @@ void flux_metal_cleanup(void);
  * Device and pipelines are preserved; only data buffers are cleared.
  */
 void flux_metal_reset(void);
+void flux_metal_rope_cache_begin(void);
 
 /* Debug: Clear only specific caches (for isolating issues) */
 void flux_metal_clear_weight_cache_only(void);

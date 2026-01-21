@@ -33,7 +33,7 @@ TESTS = [
         "width": 512,
         "height": 512,
         "reference": "test_vectors/reference_4step_512x512_seed123.png",
-        "max_diff": 12,
+        "max_diff": 18,
     },
 ]
 

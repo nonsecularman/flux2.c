@@ -60,13 +60,9 @@ static int bf16_debug_enabled(void) {
     return enabled;
 }
 
-/* Disable GPU tensor batch mode for bf16 pipeline when debugging determinism. */
+/* Keep bf16 batching off to avoid nondeterministic results. */
 static int bf16_batch_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        enabled = getenv("FLUX_BF16_NO_BATCH") ? 0 : 1;
-    }
-    return enabled;
+    return 0;
 }
 
 #define BF16_DEBUG(...) \
@@ -2226,6 +2222,9 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
                                             const float *t_emb,
                                             const float *img_rope_cos, const float *img_rope_sin,
                                             const float *txt_rope_cos, const float *txt_rope_sin) {
+#ifdef USE_METAL
+    flux_metal_rope_cache_begin();
+#endif
     int hidden = tf->hidden_size;
     int head_dim = tf->head_dim;
     int mlp_hidden = tf->mlp_hidden;
@@ -2324,10 +2323,10 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
     }
 
     /* Double-stream blocks */
-    if (bf16_batch_enabled()) {
-        flux_gpu_batch_begin();
-    }
     for (int i = 0; i < tf->num_double_layers; i++) {
+        if (bf16_batch_enabled()) {
+            flux_gpu_batch_begin();
+        }
         if (tf->use_mmap) {
             load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
@@ -2352,9 +2351,9 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
-    }
-    if (bf16_batch_enabled()) {
-        flux_gpu_batch_end();
+        if (bf16_batch_enabled()) {
+            flux_gpu_batch_end();
+        }
     }
 
     /* Concatenate text and image for single blocks */
@@ -2367,6 +2366,9 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
         flux_gpu_batch_begin();
     }
     flux_gpu_concat_seq_bf16(concat_hidden, txt_hidden, img_hidden, txt_seq, img_seq, hidden);
+    if (bf16_batch_enabled()) {
+        flux_gpu_batch_end();
+    }
 
     /* Single-stream modulation */
     int mod_size = hidden * 3;
@@ -2382,6 +2384,9 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
     }
 
     for (int i = 0; i < tf->num_single_layers; i++) {
+        if (bf16_batch_enabled()) {
+            flux_gpu_batch_begin();
+        }
         if (tf->use_mmap) {
             load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
@@ -2412,9 +2417,9 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
-    }
-    if (bf16_batch_enabled()) {
-        flux_gpu_batch_end();
+        if (bf16_batch_enabled()) {
+            flux_gpu_batch_end();
+        }
     }
 
     /* Slice image portion for final layer */
@@ -2423,7 +2428,13 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
         BF16_DEBUG("[BF16] failed to slice image hidden\n");
         goto cleanup;
     }
+    if (bf16_batch_enabled()) {
+        flux_gpu_batch_begin();
+    }
     flux_gpu_slice_seq_bf16(img_hidden_final, concat_hidden, img_seq, hidden, txt_seq);
+    if (bf16_batch_enabled()) {
+        flux_gpu_batch_end();
+    }
 
     /* Final layer (bf16) */
     float *final_mod = tf->double_mod_img;
@@ -2440,6 +2451,9 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
         BF16_DEBUG("[BF16] failed to allocate final_norm\n");
         goto cleanup;
     }
+    if (bf16_batch_enabled()) {
+        flux_gpu_batch_begin();
+    }
     flux_gpu_adaln_norm_bf16(final_norm, img_hidden_final, final_shift, final_scale,
                              img_seq, hidden, 1e-6f);
 
@@ -2449,12 +2463,18 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
         BF16_DEBUG("[BF16] final projection failed\n");
         goto cleanup;
     }
+    if (bf16_batch_enabled()) {
+        flux_gpu_batch_end();
+    }
 
     output_f32 = flux_gpu_tensor_bf16_to_f32(output_bf16);
     if (!output_f32) {
         BF16_DEBUG("[BF16] failed to convert output to f32\n");
         goto cleanup;
     }
+
+    /* Ensure any queued GPU work is complete before reading back. */
+    flux_gpu_sync();
 
     output_nlc = (float *)malloc((size_t)img_seq * channels * sizeof(float));
     if (!output_nlc) {
