@@ -32,6 +32,18 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 
 *Generated with: `./flux -i antirez.png -o antirez_to_drawing.png -p "make it a drawing" -d flux-klein-model`*
 
+## Features
+
+- **Zero dependencies**: Pure C implementation, works standalone. BLAS optional for ~30x speedup (Apple Accelerate on macOS, OpenBLAS on Linux)
+- **Metal GPU acceleration**: Automatic on Apple Silicon Macs. Performance matches PyTorch's optimized MPS pipeline
+- **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run FLUX.2 at all
+- **Text-to-image**: Generate images from text prompts
+- **Image-to-image**: Transform existing images guided by prompts
+- **Integrated text encoder**: Qwen3-4B encoder built-in, no external embedding computation needed
+- **Memory efficient**: Automatic encoder release after encoding (~8GB freed)
+- **Memory-mapped weights**: Enabled by default. Reduces peak memory from ~16GB to ~4-5GB. Fastest mode on MPS; BLAS users with plenty of RAM may prefer `--no-mmap` for faster inference
+- **Terminal image display**: watch the resulting image without leaving your terminal (Only with Ghostty / Kitty).
+
 ### Terminal Image Display
 
 ![Kitty protocol example](images/kitty-example.png)
@@ -47,17 +59,6 @@ Display generated images directly in your terminal with `--show`, or watch the d
 ```
 
 Requires a terminal supporting the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/), such as [Kitty](https://sw.kovidgoyal.net/kitty/) or [Ghostty](https://ghostty.org/).
-
-## Features
-
-- **Zero dependencies**: Pure C implementation, works standalone. BLAS optional for ~30x speedup (Apple Accelerate on macOS, OpenBLAS on Linux)
-- **Metal GPU acceleration**: Automatic on Apple Silicon Macs. Performance matches PyTorch's optimized MPS pipeline
-- **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run FLUX.2 at all
-- **Text-to-image**: Generate images from text prompts
-- **Image-to-image**: Transform existing images guided by prompts
-- **Integrated text encoder**: Qwen3-4B encoder built-in, no external embedding computation needed
-- **Memory efficient**: Automatic encoder release after encoding (~8GB freed)
-- **Memory-mapped weights**: Enabled by default. Reduces peak memory from ~16GB to ~4-5GB. Fastest mode on MPS; BLAS users with plenty of RAM may prefer `--no-mmap` for faster inference
 
 ## Usage
 
