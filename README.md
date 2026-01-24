@@ -39,9 +39,11 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 - **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run FLUX.2 at all
 - **Text-to-image**: Generate images from text prompts
 - **Image-to-image**: Transform existing images guided by prompts
+- **Multi-reference**: Combine multiple reference images (e.g., `-i car.png -i beach.png` for "car on beach")
 - **Integrated text encoder**: Qwen3-4B encoder built-in, no external embedding computation needed
 - **Memory efficient**: Automatic encoder release after encoding (~8GB freed)
 - **Memory-mapped weights**: Enabled by default. Reduces peak memory from ~16GB to ~4-5GB. Fastest mode on MPS; BLAS users with plenty of RAM may prefer `--no-mmap` for faster inference
+- **Size-independent seeds**: Same seed produces similar compositions at different resolutions. Explore at 256×256, then render at 512×512 with the same seed
 - **Terminal image display**: watch the resulting image without leaving your terminal (Ghostty, Kitty, or iTerm2).
 
 ### Terminal Image Display
@@ -51,17 +53,14 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 Display generated images directly in your terminal with `--show`, or watch the denoising process step-by-step with `--show-steps`:
 
 ```bash
-# Display final image in terminal (Kitty/Ghostty)
+# Display final image in terminal (auto-detects Kitty/Ghostty/iTerm2)
 ./flux -d flux-klein-model -p "a cute robot" -o robot.png --show
 
-# Display final image in terminal (iTerm2)
-./flux -d flux-klein-model -p "a cute robot" -o robot.png --show --iterm2
-
-# Display each denoising step (slower, but interesting to watch)
+# Display each denoising step (Kitty/Ghostty only, slower but interesting to watch)
 ./flux -d flux-klein-model -p "a cute robot" -o robot.png --show-steps
 ```
 
-Requires a terminal supporting the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (such as [Kitty](https://sw.kovidgoyal.net/kitty/) or [Ghostty](https://ghostty.org/)), or [iTerm2](https://iterm2.com/) with the `--iterm2` flag.
+Requires a terminal supporting the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (such as [Kitty](https://sw.kovidgoyal.net/kitty/) or [Ghostty](https://ghostty.org/)), or [iTerm2](https://iterm2.com/). Terminal type is auto-detected from environment variables.
 
 ## Usage
 
@@ -90,6 +89,63 @@ FLUX.2 uses **in-context conditioning** for image-to-image generation. Unlike tr
 - Good: `"oil painting of a woman with sunglasses, impressionist style"`
 - Less good: `"make it an oil painting"` (instructional prompts may work less well)
 
+**Super Resolution:** Since the reference image can be a different size than the output, you can use img2img for upscaling:
+
+```bash
+./flux -d flux-klein-model -i small.png -W 1024 -H 1024 -o big.png -p "Create an exact copy of the input image."
+```
+
+The model will generate a higher-resolution version while preserving the composition and details of the input.
+
+### Multi-Reference Generation
+
+Combine elements from multiple reference images:
+
+```bash
+./flux -d flux-klein-model -i car.png -i beach.png -p "a sports car on the beach" -o result.png
+```
+
+Each reference image is encoded separately and passed to the transformer with different positional embeddings (T=10, T=20, T=30, ...). The model attends to all references during generation, allowing it to combine elements from each.
+
+**Example:**
+- Reference 1: A red sports car
+- Reference 2: A tropical beach with palm trees
+- Prompt: "combine the two images"
+- Result: A red sports car on a tropical beach
+
+You can specify up to 16 reference images with multiple `-i` flags. The prompt guides how the references are combined.
+
+### Interactive CLI Mode
+
+Start without `-p` to enter interactive mode:
+
+```bash
+./flux -d flux-klein-model
+```
+
+Generate images by typing prompts. Each image gets a `$N` reference ID:
+
+```
+flux> a red sports car
+Done -> /tmp/flux-.../image-0001.png (ref $0)
+
+flux> a tropical beach
+Done -> /tmp/flux-.../image-0002.png (ref $1)
+
+flux> $0 $1 combine them
+Generating 256x256 (multi-ref, 2 images)...
+Done -> /tmp/flux-.../image-0003.png (ref $2)
+```
+
+**Prompt syntax:**
+- `prompt` - text-to-image
+- `512x512 prompt` - set size inline
+- `$ prompt` - img2img with last image
+- `$N prompt` - img2img with reference $N
+- `$0 $3 prompt` - multi-reference (combine images)
+
+**Commands:** `!help`, `!save`, `!load`, `!seed`, `!size`, `!steps`, `!explore`, `!show`, `!quit`
+
 ### Command Line Options
 
 **Required:**
@@ -109,16 +165,15 @@ FLUX.2 uses **in-context conditioning** for image-to-image generation. Unlike tr
 
 **Image-to-image options:**
 ```
--i, --input PATH      Input image for img2img
+-i, --input PATH      Reference image (can be specified multiple times)
 ```
 
 **Output options:**
 ```
 -q, --quiet           Silent mode, no output
 -v, --verbose         Show detailed config and timing info
-    --show            Display image in terminal (Kitty protocol)
-    --show-steps      Display each denoising step (slow)
-    --iterm2          Use iTerm2 protocol instead of Kitty
+    --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2)
+    --show-steps      Display each denoising step (Kitty/Ghostty only)
 ```
 
 **Other options:**
@@ -493,11 +548,10 @@ typedef struct {
     int height;             /* Output height in pixels (default: 256) */
     int num_steps;          /* Denoising steps, use 4 for klein (default: 4) */
     int64_t seed;           /* Random seed, -1 for random (default: -1) */
-    float strength;         /* img2img only: 0.0-1.0 (default: 0.75) */
 } flux_params;
 
 /* Initialize with sensible defaults */
-#define FLUX_PARAMS_DEFAULT { 256, 256, 4, -1, 0.75f }
+#define FLUX_PARAMS_DEFAULT { 256, 256, 4, -1 }
 ```
 
 ## Debugging

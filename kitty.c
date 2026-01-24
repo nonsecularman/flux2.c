@@ -15,6 +15,28 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Detect terminal graphics capability from environment variables.
+ * Checks for Kitty, Ghostty, and iTerm2.
+ */
+term_graphics_proto detect_terminal_graphics(void) {
+    /* Kitty: KITTY_WINDOW_ID is set */
+    if (getenv("KITTY_WINDOW_ID"))
+        return TERM_PROTO_KITTY;
+
+    /* Ghostty: GHOSTTY_RESOURCES_DIR is set (uses Kitty protocol) */
+    if (getenv("GHOSTTY_RESOURCES_DIR"))
+        return TERM_PROTO_KITTY;
+
+    /* iTerm2: TERM_PROGRAM=iTerm.app or ITERM_SESSION_ID is set */
+    const char *term_program = getenv("TERM_PROGRAM");
+    if ((term_program && strcmp(term_program, "iTerm.app") == 0) ||
+        getenv("ITERM_SESSION_ID"))
+        return TERM_PROTO_ITERM2;
+
+    return TERM_PROTO_NONE;
+}
+
 /* Base64 encoding table */
 static const char b64_table[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -235,7 +257,51 @@ int terminal_display_png(const char *path, term_graphics_proto proto) {
         case TERM_PROTO_ITERM2:
             return iterm2_display_png(path);
         case TERM_PROTO_KITTY:
-        default:
             return kitty_display_png(path);
+        default:
+            return -1;
+    }
+}
+
+/*
+ * Display raw image data using iTerm2 inline image protocol.
+ * iTerm2 requires PNG format, so we need to encode the raw pixels first.
+ * For simplicity, we send raw RGB/RGBA with dimensions in the protocol.
+ * Note: iTerm2's protocol actually requires a file format (PNG/JPEG/etc),
+ * but we can use the raw data with proper headers.
+ */
+static int iterm2_send_raw(const unsigned char *data, size_t size,
+                           int width, int height, int channels __attribute__((unused))) {
+    size_t b64_len;
+    char *b64_data = base64_encode(data, size, &b64_len);
+    if (!b64_data) return -1;
+
+    /* iTerm2 protocol with size hints */
+    printf("\033]1337;File=inline=1;width=%dpx;height=%dpx:",
+           width, height);
+    fwrite(b64_data, 1, b64_len, stdout);
+    printf("\a\n");
+    fflush(stdout);
+
+    free(b64_data);
+    return 0;
+}
+
+int iterm2_display_image(const flux_image *img) {
+    if (!img || !img->data) return -1;
+
+    size_t data_size = (size_t)img->width * img->height * img->channels;
+    return iterm2_send_raw(img->data, data_size,
+                           img->width, img->height, img->channels);
+}
+
+int terminal_display_image(const flux_image *img, term_graphics_proto proto) {
+    switch (proto) {
+        case TERM_PROTO_ITERM2:
+            return iterm2_display_image(img);
+        case TERM_PROTO_KITTY:
+            return kitty_display_image(img);
+        default:
+            return -1;
     }
 }

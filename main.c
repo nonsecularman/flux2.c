@@ -15,7 +15,6 @@
  *   -s, --steps N         Number of sampling steps (default: 4)
  *   -S, --seed N          Random seed (-1 for random)
  *   -i, --input PATH      Input image for img2img
- *   -t, --strength N      Img2img strength (0.0-1.0)
  *   -q, --quiet           No output, just generate
  *   -v, --verbose         Extra detailed output
  *   -h, --help            Show help
@@ -23,6 +22,7 @@
 
 #include "flux.h"
 #include "flux_kernels.h"
+#include "flux_cli.h"
 #include "kitty.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -198,7 +198,7 @@ static double timer_end(void) {
 #define DEFAULT_WIDTH 256
 #define DEFAULT_HEIGHT 256
 #define DEFAULT_STEPS 4
-#define DEFAULT_STRENGTH 0.75f
+#define MAX_INPUT_IMAGES 16
 
 static void print_usage(const char *prog) {
     fprintf(stderr, "FLUX.2 klein 4B - Pure C Image Generation\n\n");
@@ -212,15 +212,14 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -H, --height N        Output height (default: %d)\n", DEFAULT_HEIGHT);
     fprintf(stderr, "  -s, --steps N         Sampling steps (default: %d)\n", DEFAULT_STEPS);
     fprintf(stderr, "  -S, --seed N          Random seed (-1 for random)\n\n");
-    fprintf(stderr, "Image-to-image options:\n");
-    fprintf(stderr, "  -i, --input PATH      Input image for img2img\n");
-    fprintf(stderr, "  -t, --strength N      Strength 0.0-1.0 (default: %.2f)\n\n", DEFAULT_STRENGTH);
+    fprintf(stderr, "Reference images (img2img / multi-reference):\n");
+    fprintf(stderr, "  -i, --input PATH      Reference image (can specify up to %d)\n", MAX_INPUT_IMAGES);
+    fprintf(stderr, "                        Multiple -i flags combine images via in-context conditioning\n\n");
     fprintf(stderr, "Output options:\n");
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
-    fprintf(stderr, "      --show            Display image in terminal (Kitty protocol)\n");
-    fprintf(stderr, "      --show-steps      Display each denoising step (slow)\n");
-    fprintf(stderr, "      --iterm2          Use iTerm2 protocol instead of Kitty\n\n");
+    fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2)\n");
+    fprintf(stderr, "      --show-steps      Display each denoising step (Kitty/Ghostty only)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
@@ -228,7 +227,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -h, --help            Show this help\n\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s -d model/ -p \"a cat on a rainbow\" -o cat.png\n", prog);
-    fprintf(stderr, "  %s -d model/ -p \"oil painting\" -i photo.png -o art.png -t 0.7\n", prog);
+    fprintf(stderr, "  %s -d model/ -p \"oil painting\" -i photo.png -o art.png\n", prog);
+    fprintf(stderr, "  %s -d model/ -p \"combine them\" -i car.png -i beach.png -o result.png\n", prog);
 }
 
 /* ========================================================================
@@ -254,7 +254,6 @@ int main(int argc, char *argv[]) {
         {"steps",      required_argument, 0, 's'},
         {"seed",       required_argument, 0, 'S'},
         {"input",      required_argument, 0, 'i'},
-        {"strength",   required_argument, 0, 't'},
         {"embeddings", required_argument, 0, 'e'},
         {"noise",      required_argument, 0, 'n'},
         {"quiet",      no_argument,       0, 'q'},
@@ -265,7 +264,6 @@ int main(int argc, char *argv[]) {
         {"no-mmap",    no_argument,       0, 'M'},
         {"show",       no_argument,       0, 'k'},
         {"show-steps", no_argument,       0, 'K'},
-        {"iterm2",     no_argument,       0, 'I'},
         {"debug-py",   no_argument,       0, 'D'},
         {0, 0, 0, 0}
     };
@@ -274,7 +272,8 @@ int main(int argc, char *argv[]) {
     char *model_dir = NULL;
     char *prompt = NULL;
     char *output_path = NULL;
-    char *input_path = NULL;
+    char *input_paths[MAX_INPUT_IMAGES] = {NULL};
+    int num_inputs = 0;
     char *embeddings_path = NULL;
     char *noise_path = NULL;
 
@@ -282,8 +281,7 @@ int main(int argc, char *argv[]) {
         .width = DEFAULT_WIDTH,
         .height = DEFAULT_HEIGHT,
         .num_steps = DEFAULT_STEPS,
-        .seed = -1,
-        .strength = DEFAULT_STRENGTH
+        .seed = -1
     };
 
     int width_set = 0, height_set = 0;
@@ -291,7 +289,7 @@ int main(int argc, char *argv[]) {
     int show_image = 0;
     int show_steps = 0;
     int debug_py = 0;
-    term_graphics_proto graphics_proto = TERM_PROTO_KITTY;
+    term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
     while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhVmMD",
@@ -304,8 +302,13 @@ int main(int argc, char *argv[]) {
             case 'H': params.height = atoi(optarg); height_set = 1; break;
             case 's': params.num_steps = atoi(optarg); break;
             case 'S': params.seed = atoll(optarg); break;
-            case 'i': input_path = optarg; break;
-            case 't': params.strength = atof(optarg); break;
+            case 'i':
+                if (num_inputs < MAX_INPUT_IMAGES) {
+                    input_paths[num_inputs++] = optarg;
+                } else {
+                    fprintf(stderr, "Warning: Maximum %d input images supported\n", MAX_INPUT_IMAGES);
+                }
+                break;
             case 'e': embeddings_path = optarg; break;
             case 'n': noise_path = optarg; break;
             case 'q': output_level = OUTPUT_QUIET; break;
@@ -318,7 +321,6 @@ int main(int argc, char *argv[]) {
             case 'M': use_mmap = 0; break;
             case 'k': show_image = 1; break;
             case 'K': show_steps = 1; break;
-            case 'I': graphics_proto = TERM_PROTO_ITERM2; break;
             case 'D': debug_py = 1; break;
             default:
                 print_usage(argv[0]);
@@ -332,15 +334,21 @@ int main(int argc, char *argv[]) {
         print_usage(argv[0]);
         return 1;
     }
-    if (!prompt && !embeddings_path && !debug_py) {
-        fprintf(stderr, "Error: Prompt (-p) or embeddings file (-e) is required\n\n");
-        print_usage(argv[0]);
-        return 1;
-    }
-    if (!output_path) {
-        fprintf(stderr, "Error: Output path (-o) is required\n\n");
-        print_usage(argv[0]);
-        return 1;
+
+    /* Interactive mode: -d provided but no -p, -e, -o, or --debug-py */
+    int interactive_mode = (!prompt && !embeddings_path && !output_path && !debug_py);
+
+    if (!interactive_mode) {
+        if (!prompt && !embeddings_path && !debug_py) {
+            fprintf(stderr, "Error: Prompt (-p) or embeddings file (-e) is required\n\n");
+            print_usage(argv[0]);
+            return 1;
+        }
+        if (!output_path) {
+            fprintf(stderr, "Error: Output path (-o) is required\n\n");
+            print_usage(argv[0]);
+            return 1;
+        }
     }
 
     /* Validate parameters */
@@ -354,10 +362,6 @@ int main(int argc, char *argv[]) {
     }
     if (params.num_steps < 1 || params.num_steps > FLUX_MAX_STEPS) {
         fprintf(stderr, "Error: Steps must be between 1 and %d\n", FLUX_MAX_STEPS);
-        return 1;
-    }
-    if (params.strength < 0.0f || params.strength > 1.0f) {
-        fprintf(stderr, "Error: Strength must be between 0.0 and 1.0\n");
         return 1;
     }
 
@@ -379,9 +383,11 @@ int main(int argc, char *argv[]) {
     LOG_VERBOSE("Output: %s\n", output_path);
     LOG_VERBOSE("Size: %dx%d\n", params.width, params.height);
     LOG_VERBOSE("Steps: %d\n", params.num_steps);
-    if (input_path) {
-        LOG_VERBOSE("Input: %s\n", input_path);
-        LOG_VERBOSE("Strength: %.2f\n", params.strength);
+    if (num_inputs > 0) {
+        LOG_VERBOSE("Input images: %d\n", num_inputs);
+        for (int i = 0; i < num_inputs; i++) {
+            LOG_VERBOSE("  [%d] %s\n", i + 1, input_paths[i]);
+        }
     }
     LOG_VERBOSE("\n");
 
@@ -406,6 +412,13 @@ int main(int argc, char *argv[]) {
     LOG_NORMAL(" done (%.1fs)\n", load_time);
     LOG_VERBOSE("  Model info: %s\n", flux_model_info(ctx));
 
+    /* Interactive mode: start REPL */
+    if (interactive_mode) {
+        int rc = flux_cli_run(ctx, model_dir);
+        flux_free(ctx);
+        return rc;
+    }
+
     /* Set up progress callbacks (for normal and verbose modes) */
     if (output_level >= OUTPUT_NORMAL) {
         cli_setup_progress();
@@ -414,9 +427,12 @@ int main(int argc, char *argv[]) {
     /* Set up step image callback if requested */
     if (show_steps) {
         if (graphics_proto == TERM_PROTO_ITERM2) {
-            fprintf(stderr, "Warning: --show-steps requires Kitty protocol, ignoring --iterm2 for step display\n");
+            fprintf(stderr, "Warning: --show-steps requires Kitty protocol (not supported in iTerm2)\n");
+        } else if (graphics_proto == TERM_PROTO_NONE) {
+            fprintf(stderr, "Warning: --show-steps requires Kitty or Ghostty terminal\n");
+        } else {
+            flux_set_step_image_callback(ctx, cli_step_image_callback);
         }
-        flux_set_step_image_callback(ctx, cli_step_image_callback);
     }
 
     /* Generate image */
@@ -428,30 +444,39 @@ int main(int argc, char *argv[]) {
         /* ============== Debug mode: use Python inputs ============== */
         LOG_NORMAL("Debug mode: loading Python inputs from /tmp/py_*.bin\n");
         output = flux_img2img_debug_py(ctx, &params);
-    } else if (input_path) {
-        /* ============== Image-to-image mode ============== */
-        LOG_NORMAL("Loading input image...");
+    } else if (num_inputs > 0) {
+        /* ============== Image-to-image mode (single or multi-reference) ============== */
+        LOG_NORMAL("Loading %d input image%s...", num_inputs, num_inputs > 1 ? "s" : "");
         if (output_level >= OUTPUT_NORMAL) fflush(stderr);
         timer_begin();
 
-        flux_image *input = flux_image_load(input_path);
-        if (!input) {
-            fprintf(stderr, "\nError: Failed to load input image: %s\n", input_path);
-            flux_free(ctx);
-            return 1;
+        flux_image *inputs[MAX_INPUT_IMAGES];
+        for (int i = 0; i < num_inputs; i++) {
+            inputs[i] = flux_image_load(input_paths[i]);
+            if (!inputs[i]) {
+                fprintf(stderr, "\nError: Failed to load input image: %s\n", input_paths[i]);
+                for (int j = 0; j < i; j++) flux_image_free(inputs[j]);
+                flux_free(ctx);
+                return 1;
+            }
         }
 
         LOG_NORMAL(" done (%.1fs)\n", timer_end());
-        LOG_VERBOSE("  Input: %dx%d, %d channels\n",
-                    input->width, input->height, input->channels);
+        for (int i = 0; i < num_inputs; i++) {
+            LOG_VERBOSE("  Input[%d]: %dx%d, %d channels\n",
+                        i + 1, inputs[i]->width, inputs[i]->height, inputs[i]->channels);
+        }
 
-        /* Use input image dimensions if not explicitly set */
-        if (!width_set) params.width = input->width;
-        if (!height_set) params.height = input->height;
+        /* Use first input image dimensions if not explicitly set */
+        if (!width_set) params.width = inputs[0]->width;
+        if (!height_set) params.height = inputs[0]->height;
 
-        /* Generate */
-        output = flux_img2img(ctx, prompt, input, &params);
-        flux_image_free(input);
+        /* Generate with multi-reference */
+        output = flux_multiref(ctx, prompt, (const flux_image **)inputs, num_inputs, &params);
+
+        for (int i = 0; i < num_inputs; i++) {
+            flux_image_free(inputs[i]);
+        }
 
     } else if (embeddings_path) {
         /* ============== External embeddings mode ============== */
